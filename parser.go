@@ -4,8 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
-	"go/types"
-	"os"
 	"regexp"
 	"strings"
 
@@ -17,29 +15,25 @@ var ErrFunctionNotFound = errors.New("function not found")
 
 // ParseFunction parses the Go source code for a specific function.
 func ParseFunction(filePath string, funcName string) (*FunctionDetails, error) {
-	// Many tools pass their command-line arguments (after any flags)
-	// uninterpreted to packages.Load so that it can interpret them
-	// according to the conventions of the underlying build system.
 	cfg := &packages.Config{
 		Mode: packages.NeedFiles | packages.NeedSyntax | packages.NeedTypesInfo | packages.NeedTypes,
 		Dir:  filePath,
 	}
 	pkgs, err := packages.Load(cfg, ".")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "load: %v\n", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("failed to load packages: %v", err)
 	}
 	if packages.PrintErrors(pkgs) > 0 {
-		return nil, fmt.Errorf("parse error")
+		return nil, fmt.Errorf("encountered parse errors")
 	}
 
 	var fn *ast.FuncDecl
 	var pkg *packages.Package
 	for _, p := range pkgs {
-		f, ok := findFunction(p, funcName)
-		if ok {
+		if f, ok := findFunction(p, funcName); ok {
 			fn = f
 			pkg = p
+			break
 		}
 	}
 	if fn == nil {
@@ -49,225 +43,152 @@ func ParseFunction(filePath string, funcName string) (*FunctionDetails, error) {
 	funcDetail := &FunctionDetails{
 		Name:        fn.Name.Name,
 		Description: cleanupComment(fn.Doc),
-		Parameters: &Definition{
-			Type:       "object",
-			Properties: map[string]*Definition{},
-		},
-	}
-	for _, param := range fn.Type.Params.List {
-		name := identsToName(param.Names)
-		pd, err := paramToDetail(pkg, param)
-		if err != nil {
-			return nil, fmt.Errorf("issue parsing parameter '%v': %w", name, err)
-		}
-		funcDetail.Parameters.Properties[name] = pd
-		funcDetail.Parameters.Required = append(funcDetail.Parameters.Required, name)
-	}
-	if len(funcDetail.Parameters.Properties) == 1 && funcDetail.Parameters.Type == Object {
-		for _, p := range funcDetail.Parameters.Properties {
-			funcDetail.Parameters = p
-		}
+		Parameters:  parseParameters(pkg, fn.Type.Params.List),
 	}
 	return funcDetail, nil
 }
 
-var slashCommentPrefixRe = regexp.MustCompile("^// ?")
+// parseParameters parses function parameters and constructs a Definition.
+func parseParameters(pkg *packages.Package, params []*ast.Field) *Definition {
+	paramDef := &Definition{
+		Type:       Object,
+		Properties: make(map[string]*Definition),
+	}
 
-func trimCommentPrefix(c string) string {
-	return slashCommentPrefixRe.ReplaceAllString(c, "")
-}
-
-func cleanupComment(commentGroups ...*ast.CommentGroup) string {
-	var commentParts []string
-	for _, cg := range commentGroups {
-		if cg == nil {
+	for _, param := range params {
+		name := param.Names[0].Name
+		pd, err := paramToDetail(pkg, param)
+		if err != nil {
+			fmt.Printf("issue parsing parameter '%v': %v\n", name, err)
 			continue
 		}
-		for _, c := range cg.List {
-			commentParts = append(commentParts, trimCommentPrefix(c.Text))
+		paramDef.Properties[name] = pd
+		paramDef.Required = append(paramDef.Required, name)
+	}
+
+	if len(paramDef.Properties) == 1 && paramDef.Type == Object {
+		var singlePropertyName string
+		for name := range paramDef.Properties {
+			singlePropertyName = name
+			break
+		}
+		paramDef = paramDef.Properties[singlePropertyName]
+	}
+	return paramDef
+}
+
+// Regex for comment prefix.
+var slashCommentPrefixRe = regexp.MustCompile("^// ?")
+
+func cleanupComment(commentGroups ...*ast.CommentGroup) string {
+	var comments []string
+	for _, cg := range commentGroups {
+		if cg != nil {
+			for _, c := range cg.List {
+				comments = append(comments, slashCommentPrefixRe.ReplaceAllString(c.Text, ""))
+			}
 		}
 	}
-	return strings.Join(commentParts, " ")
+	return strings.Join(comments, " ")
 }
 
 func paramToDetail(pkg *packages.Package, param *ast.Field) (*Definition, error) {
-	paramType := exprToType(pkg, param.Type)
+	paramType := exprToType(pkg.TypesInfo, param.Type)
 	d := &Definition{
 		Type:        paramType,
-		Properties:  map[string]*Definition{},
+		Properties:  make(map[string]*Definition),
 		Description: cleanupComment(param.Doc, param.Comment),
 	}
-	if param.Tag != nil {
-		enumOptions, err := parseEnumTag(param.Tag.Value)
-		if err != nil {
-			return nil, fmt.Errorf("issue parsing 'enum' field tag: %w", err)
-		}
+	if enumOptions, err := parseEnumTag(param.Tag); err != nil {
+		return nil, fmt.Errorf("issue parsing 'enum' field tag: %v", err)
+	} else {
 		d.Enum = enumOptions
 	}
 
-	if paramType == "object" {
-		var err error
-		var st *ast.StructType
-		switch pt := param.Type.(type) {
-		case *ast.StructType:
-			st = pt
-		case *ast.Ident:
-			st, _ = findStructTypeFromIdent(pt)
-		}
-		for _, f := range st.Fields.List {
-			name := identsToName(f.Names)
-			d.Properties[name], err = paramToDetail(pkg, f)
-			if err != nil {
-				return nil, err
-			}
-			required := true
-			if f.Tag != nil {
-				if req, _ := parseRequiredTag(f.Tag.Value); req {
-					required = req
+	var err error
+	switch paramType {
+	case Object:
+		if st, ok := findStructTypeFromIdent(param.Type.(*ast.Ident)); ok {
+			for _, f := range st.Fields.List {
+				fieldName := f.Names[0].Name
+				d.Properties[fieldName], err = paramToDetail(pkg, f)
+				if err != nil {
+					return nil, fmt.Errorf("issue parsing field '%v': %v", fieldName, err)
+				}
+
+				// Set field as required unless the 'required' tag explicitly marks it otherwise.
+				if required, tagErr := parseRequiredTag(f.Tag); tagErr == nil && required {
+					d.Required = append(d.Required, fieldName)
 				}
 			}
-			if required {
-				d.Required = append(d.Required, name)
-			}
 		}
-	}
-	if paramType == "array" {
+	case Array:
 		d.Items = &Definition{
-			Type: exprToType(pkg, param.Type.(*ast.ArrayType).Elt),
+			Type: exprToType(pkg.TypesInfo, param.Type.(*ast.ArrayType).Elt),
 		}
 	}
 	return d, nil
 }
 
-func findStructTypeFromIdent(ident *ast.Ident) (*ast.StructType, bool) {
-	// Check if the ident has an associated object (it should if the parser had type info).
-	if ident.Obj == nil {
-		return nil, false
-	}
-
-	// Check if the declaration of the object is a type specification.
-	typeSpec, ok := ident.Obj.Decl.(*ast.TypeSpec)
-	if !ok {
-		return nil, false
-	}
-
-	// Finally, assert that the type specification is indeed a struct type.
-	structType, ok := typeSpec.Type.(*ast.StructType)
-	if !ok {
-		return nil, false
-	}
-
-	return structType, true
-}
-
-func parseEnumTag(tag string) ([]string, error) {
-	tag = strings.Trim(tag, "`")
-	tags, err := structtag.Parse(tag)
-	if err != nil {
-		return nil, fmt.Errorf("parse('%v'): %w", tag, err)
-	}
-	value, err := tags.Get("enum")
-	if err != nil {
+func parseEnumTag(tag *ast.BasicLit) ([]string, error) {
+	if tag == nil {
 		return nil, nil
 	}
-	var options []string
-	options = append(options, value.Name)
-	options = append(options, value.Options...)
-	return options, nil
+	val := strings.Trim(tag.Value, "`")
+	tags, err := structtag.Parse(val)
+	if err != nil {
+		return nil, err
+	}
+	enumTag, err := tags.Get("enum")
+	if err != nil {
+		return nil, nil // No enum tag is not an error.
+	}
+	return append([]string{enumTag.Name}, enumTag.Options...), nil
 }
 
-func parseRequiredTag(tag string) (bool, error) {
-	tag = strings.Trim(tag, "`")
-	tags, err := structtag.Parse(tag)
-	if err != nil {
-		return false, fmt.Errorf("parse('%v'): %w", tag, err)
-	}
-	value, err := tags.Get("required")
-	if err != nil {
-		return false, nil
-	}
-	falseyValues := map[string]bool{
-		"0":     true,
-		"no":    true,
-		"false": true,
-	}
-	if falseyValues[strings.ToLower(value.Name)] {
+// parseRequiredTag parses the 'required' tag from a struct field's tag.
+func parseRequiredTag(tag *ast.BasicLit) (bool, error) {
+	if tag == nil {
 		return true, nil
 	}
-	return false, nil
-}
-
-func identsToName(idents []*ast.Ident) string {
-	for _, i := range idents {
-		if i.Name != "" {
-			return i.Name
-		}
+	val := strings.Trim(tag.Value, "`")
+	tags, err := structtag.Parse(val)
+	if err != nil {
+		return false, fmt.Errorf("error parsing tags '%v': %v", tag, err)
 	}
-	return ""
+	requiredTag, err := tags.Get("required")
+	if err != nil { // we presume that the 'required' tag is not present.
+		return true, nil
+	}
+
+	// We define falsey values that denote a field is not required.
+	falseyValues := map[string]bool{
+		"false": true,
+		"no":    true,
+		"0":     true,
+	}
+	// If the 'required' tag's value is a falsey value, the field is not required.
+	return !falseyValues[strings.ToLower(requiredTag.Name)], nil
 }
 
 func findFunction(pkg *packages.Package, funcName string) (*ast.FuncDecl, bool) {
 	for _, file := range pkg.Syntax {
-		f, ok := findFunctionFile(file, funcName)
-		if ok {
-			return f, true
-		}
-	}
-	return nil, false
-}
-func findFunctionFile(f *ast.File, funcName string) (*ast.FuncDecl, bool) {
-	for _, d := range f.Decls {
-		fn, ok := d.(*ast.FuncDecl)
-		if !ok {
-			continue
-		}
-		if fn.Name.Name == funcName {
-			return fn, true
+		for _, d := range file.Decls {
+			if fn, ok := d.(*ast.FuncDecl); ok && fn.Name.Name == funcName {
+				return fn, true
+			}
 		}
 	}
 	return nil, false
 }
 
-func singleStructParam(pkg *packages.Package, fieldList []*ast.Field) bool {
-	if len(fieldList) == 1 {
-		pd, _ := paramToDetail(pkg, fieldList[0])
-		if pd != nil && pd.Type == Object {
-			return true
-
+func findStructTypeFromIdent(expr ast.Expr) (*ast.StructType, bool) {
+	if ident, ok := expr.(*ast.Ident); ok && ident.Obj != nil {
+		if typeSpec, ok := ident.Obj.Decl.(*ast.TypeSpec); ok {
+			if structType, ok := typeSpec.Type.(*ast.StructType); ok {
+				return structType, true
+			}
 		}
 	}
-	return false
-}
-
-var goTypesToDataType = map[string]DataType{
-	"int":    Integer,
-	"int32":  Integer,
-	"int64":  Integer,
-	"string": String,
-	"float":  Number,
-	"bool":   Boolean,
-}
-
-// exprToType takes an expression and returns its string representation.
-func exprToType(pkg *packages.Package, expr ast.Expr) DataType {
-	switch t := expr.(type) {
-	case *ast.Ident:
-		typ := goTypesToDataType[t.Name]
-		ut := pkg.TypesInfo.Types[t].Type.Underlying()
-		switch ut.(type) {
-		case *types.Struct:
-			return Object
-		}
-		return typ
-	case *ast.ArrayType:
-		return Array
-	case *ast.StarExpr:
-		return exprToType(pkg, t.X)
-	case *ast.StructType:
-		return Object
-	// Add more cases as needed for other types.
-	default:
-		fmt.Printf("uhandled type %T\n", t)
-		return Null
-	}
+	return nil, false
 }

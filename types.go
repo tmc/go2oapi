@@ -1,5 +1,10 @@
 package go2oapi
 
+import (
+	"go/ast"
+	"go/types"
+)
+
 // Encodes the type of a field.
 type DataType string
 
@@ -38,4 +43,40 @@ type Definition struct {
 	Required []string `json:"required,omitempty"`
 	// Items specifies which data type an array contains, if the schema type is Array.
 	Items *Definition `json:"items,omitempty"`
+}
+
+func exprToType(info *types.Info, expr ast.Expr) DataType {
+	typ := info.TypeOf(expr)
+	if typ == nil {
+		return Null // or some error handling
+	}
+
+	switch typ := typ.Underlying().(type) {
+	case *types.Basic:
+		return basicTypeToDataType(typ)
+	case *types.Array, *types.Slice:
+		return Array
+	case *types.Struct:
+		return Object
+	case *types.Pointer:
+		return exprToType(info, &ast.Ident{Name: typ.Elem().String()})
+	default:
+		return Null
+	}
+}
+
+func basicTypeToDataType(basic *types.Basic) DataType {
+	switch basic.Kind() {
+	case types.Bool:
+		return Boolean
+	case types.Int, types.Int8, types.Int16, types.Int32, types.Int64,
+		types.Uint, types.Uint8, types.Uint16, types.Uint32, types.Uint64:
+		return Integer
+	case types.Float32, types.Float64:
+		return Number
+	case types.String:
+		return String
+	default:
+		return Null
+	}
 }
