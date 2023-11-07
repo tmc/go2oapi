@@ -25,5 +25,6 @@ func ExampleParseFunction() {
 	json.NewEncoder(os.Stdout).Encode(funcDetails)
 
 	// Output:
-	// {"name":"NewWidgetFactory","description":"NewWidgetFactory creates a new widget factory.","parameters":{"type":"object","properties":{"factoryInfo":{"type":"object","properties":{"Category":{"type":"string","description":"Category","enum":["foo","bar"]},"FactoryName":{"type":"string","description":"The name of the factory"},"InventoryLevels":{"type":"array","description":"InventoryLevels","items":{"type":"integer"}},"Operational":{"type":"boolean"}}}},"required":["factoryInfo"]}}
+	// {"name":"NewWidgetFactory","description":"NewWidgetFactory creates a new widget factory.","parameters":{"type":"object","properties":{"Category":{"type":"string","description":"Category","enum":["foo","bar"]},"FactoryName":{"type":"string","description":"The name of the factory"},"InventoryLevels":{"type":"array","description":"InventoryLevels","items":{"type":"integer"}},"Operational":{"type":"boolean"}},"required":["FactoryName","Category","InventoryLevels","Operational"]}}
+
 }

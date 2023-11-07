@@ -54,15 +54,18 @@ func ParseFunction(filePath string, funcName string) (*FunctionDetails, error) {
 			Properties: map[string]*Definition{},
 		},
 	}
-	if fn.Type.Params != nil {
-		for _, param := range fn.Type.Params.List {
-			name := identsToName(param.Names)
-			pd, err := paramToDetail(pkg, param)
-			if err != nil {
-				return nil, fmt.Errorf("issue parsing parameter '%v': %w", name, err)
-			}
-			funcDetail.Parameters.Properties[name] = pd
-			funcDetail.Parameters.Required = append(funcDetail.Parameters.Required, name)
+	for _, param := range fn.Type.Params.List {
+		name := identsToName(param.Names)
+		pd, err := paramToDetail(pkg, param)
+		if err != nil {
+			return nil, fmt.Errorf("issue parsing parameter '%v': %w", name, err)
+		}
+		funcDetail.Parameters.Properties[name] = pd
+		funcDetail.Parameters.Required = append(funcDetail.Parameters.Required, name)
+	}
+	if len(funcDetail.Parameters.Properties) == 1 && funcDetail.Parameters.Type == Object {
+		for _, p := range funcDetail.Parameters.Properties {
+			funcDetail.Parameters = p
 		}
 	}
 	return funcDetail, nil
@@ -112,9 +115,19 @@ func paramToDetail(pkg *packages.Package, param *ast.Field) (*Definition, error)
 			st, _ = findStructTypeFromIdent(pt)
 		}
 		for _, f := range st.Fields.List {
-			d.Properties[identsToName(f.Names)], err = paramToDetail(pkg, f)
+			name := identsToName(f.Names)
+			d.Properties[name], err = paramToDetail(pkg, f)
 			if err != nil {
 				return nil, err
+			}
+			required := true
+			if f.Tag != nil {
+				if req, _ := parseRequiredTag(f.Tag.Value); req {
+					required = req
+				}
+			}
+			if required {
+				d.Required = append(d.Required, name)
 			}
 		}
 	}
@@ -163,6 +176,27 @@ func parseEnumTag(tag string) ([]string, error) {
 	return options, nil
 }
 
+func parseRequiredTag(tag string) (bool, error) {
+	tag = strings.Trim(tag, "`")
+	tags, err := structtag.Parse(tag)
+	if err != nil {
+		return false, fmt.Errorf("parse('%v'): %w", tag, err)
+	}
+	value, err := tags.Get("required")
+	if err != nil {
+		return false, nil
+	}
+	falseyValues := map[string]bool{
+		"0":     true,
+		"no":    true,
+		"false": true,
+	}
+	if falseyValues[strings.ToLower(value.Name)] {
+		return true, nil
+	}
+	return false, nil
+}
+
 func identsToName(idents []*ast.Ident) string {
 	for _, i := range idents {
 		if i.Name != "" {
@@ -192,6 +226,17 @@ func findFunctionFile(f *ast.File, funcName string) (*ast.FuncDecl, bool) {
 		}
 	}
 	return nil, false
+}
+
+func singleStructParam(pkg *packages.Package, fieldList []*ast.Field) bool {
+	if len(fieldList) == 1 {
+		pd, _ := paramToDetail(pkg, fieldList[0])
+		if pd != nil && pd.Type == Object {
+			return true
+
+		}
+	}
+	return false
 }
 
 var goTypesToDataType = map[string]DataType{
