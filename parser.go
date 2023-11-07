@@ -45,15 +45,14 @@ func ParseFunction(filePath string, funcName string) (*FunctionDetails, error) {
 	if fn == nil {
 		return nil, ErrFunctionNotFound
 	}
-	// get
-	funcDetail := &FunctionDetails{
-		Name: fn.Name.Name,
-	}
 
-	// Parse parameters
-	funcDetail.Parameters = &Definition{
-		Type:       "object",
-		Properties: map[string]*Definition{},
+	funcDetail := &FunctionDetails{
+		Name:        fn.Name.Name,
+		Description: cleanupComment(fn.Doc),
+		Parameters: &Definition{
+			Type:       "object",
+			Properties: map[string]*Definition{},
+		},
 	}
 	if fn.Type.Params != nil {
 		for _, param := range fn.Type.Params.List {
@@ -66,7 +65,6 @@ func ParseFunction(filePath string, funcName string) (*FunctionDetails, error) {
 			funcDetail.Parameters.Required = append(funcDetail.Parameters.Required, name)
 		}
 	}
-	funcDetail.Description = cleanupComment(fn.Doc)
 	return funcDetail, nil
 }
 
@@ -80,7 +78,7 @@ func cleanupComment(commentGroups ...*ast.CommentGroup) string {
 	var commentParts []string
 	for _, cg := range commentGroups {
 		if cg == nil {
-			return ""
+			continue
 		}
 		for _, c := range cg.List {
 			commentParts = append(commentParts, trimCommentPrefix(c.Text))
